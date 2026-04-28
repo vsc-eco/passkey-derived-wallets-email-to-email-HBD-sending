@@ -153,4 +153,4 @@ These files have changes relative to altera-app main as of 2026-04-28. **Diff ag
   3. Fund oracle DID with HBD (needs RCs to submit claim txs)
   4. Domain with MX records → Resend for inbound email (only needed for email-to-email, not UI send flow)
 
-  Want me to write this as a README.md file into the repo on the O drive?
+
