@@ -1,0 +1,1006 @@
+import { getAccounts } from '@aioha/aioha/build/rpc';
+import { type Account, postingMetadataFromString } from '$lib/auth/hive/accountTypes';
+import { getDidFromUsername, getUsernameFromAuth, getUsernameFromDid } from '$lib/getAccountName';
+import swapOptions, {
+	Coin,
+	Network,
+	networkMap,
+	SendAccount,
+	TransferMethod,
+	type CoinOnNetwork,
+	type CoinOptions,
+	type IntermediaryNetwork,
+	type NecessarySendDetails,
+	type SendDetails
+} from './sendOptions';
+import { authStore, getAuth, type Auth } from '$lib/auth/store';
+import { executeTx, getSendOpGenerator, getSendOpType } from '$lib/magiTransactions/hive';
+import { getHiveSwapOp, getBtcApproveOp } from '$lib/magiTransactions/hive/vscOperations/swap';
+import { getHiveDepositOp } from '$lib/magiTransactions/hive/vscOperations/deposit';
+import { getEVMOpType } from '$lib/magiTransactions/eth';
+import { CoinAmount } from '$lib/currency/CoinAmount';
+import type { Operation, TransferOperation } from '@hiveio/dhive';
+import { addLocalTransaction } from '../../stores/localStorageTxs';
+import { createClient, signAndBrodcastTransaction, signAndBroadcastPasskey, type CallContractTransaction } from '$lib/magiTransactions/eth/client';
+import { wagmiSigner } from '$lib/magiTransactions/eth/wagmi';
+import { createPasskeySigner } from '$lib/auth/passkey/signer';
+import { ESCROW_CONTRACT_ID } from '$lib/constants';
+import { btcSigner } from '$lib/magiTransactions/bitcoin/signer';
+import { wagmiConfig } from '$lib/auth/reown';
+import { get, writable } from 'svelte/store';
+import {
+	fetchTxs,
+	getTimestamp,
+	magiTxsStore,
+	waitForExtend,
+	type TransactionInter
+} from '$lib/stores/txStores';
+import moment, { type Moment } from 'moment';
+import { getIntermediaryNetwork } from './getNetwork';
+import { validate, Network as BtcNetwork } from 'bitcoin-address-validation';
+import {
+	accountBalance,
+	type AccountBalance,
+	type HiveMainnetBalance
+} from '$lib/stores/currentBalance';
+
+export const SendTxDetails = writable<SendDetails>(blankDetails());
+
+export function blankDetails(): SendDetails {
+	return {
+		fromCoin: undefined,
+		fromNetwork: undefined,
+		fromAmount: '0',
+		enteredAmount: '0',
+		toCoin: undefined,
+		toNetwork: undefined,
+		toAmount: '0',
+		toUsername: '',
+		toDisplayName: '',
+		method: undefined,
+		account: undefined,
+		fee: undefined,
+		memo: '',
+		expectedOutput: undefined,
+		slippageBps: 100,
+		minAmountOut: undefined,
+		swapBaseFee: undefined,
+		swapClpFee: undefined,
+		swapTotalFee: undefined,
+		swapHop1Fee: undefined,
+		btcDeductFee: false,
+		btcMaxFee: undefined
+	};
+}
+
+export function scanForBalance(opts: CoinOnNetwork[]): CoinOnNetwork | undefined {
+	const accBal = get(accountBalance);
+	for (const opt of opts) {
+		if (opt.network.value === Network.magi.value) {
+			const bal = accBal.bal[opt.coin.value as keyof AccountBalance];
+			if (bal > 0) {
+				return opt;
+			}
+		} else if (opt.network.value === Network.hiveMainnet.value && accBal.connectedBal) {
+			const bal = accBal.connectedBal[opt.coin.value as keyof HiveMainnetBalance];
+			if ((bal ?? 0) > 0) {
+				return opt;
+			}
+		}
+	}
+}
+
+let tx_session_id = 0;
+
+export function getTxSessionId() {
+	return ++tx_session_id;
+}
+
+type ValidationError = {
+	success: false;
+	error: string;
+};
+type ValidationSuccess = {
+	success: true;
+	img?: string;
+	displayName?: string;
+};
+type ValidationResult = ValidationSuccess | ValidationError;
+export async function validateAddress(
+	address: string,
+	internalOnly = false
+): Promise<ValidationResult> {
+	if (address.length < 3) {
+		return {
+			success: false,
+			error: 'Minimum address length is 3 characters'
+		};
+	} else if (address.length <= 16) {
+		const accountInfo: Account = (await getAccounts([address])).result[0];
+		if (accountInfo) {
+			let displayName: string | undefined = undefined;
+			if (accountInfo.posting_json_metadata) {
+				const postingMetadata = postingMetadataFromString(
+					accountInfo.posting_json_metadata
+				).profile;
+				displayName = postingMetadata['name'];
+			}
+			return {
+				success: true,
+				displayName: displayName
+			};
+		}
+		return {
+			success: false,
+			error: 'No hive account found with this username'
+		};
+	} else if (address.length === 42 && address.startsWith('0x')) {
+		return {
+			success: true
+		};
+	} else if (validate(address, BtcNetwork.mainnet)) {
+		if (internalOnly) {
+			return {
+				success: true
+			};
+		}
+		return {
+			success: true
+		};
+	}
+	return {
+		success: false,
+		error: 'Address must be a Hive username, EVM address, or Bitcoin address'
+	};
+}
+
+export async function getDisplayName(did: string) {
+	if (!did.startsWith('hive:')) {
+		return null;
+	}
+	const accountInfo: Account = (await getAccounts([getUsernameFromDid(did)])).result[0];
+	if (!accountInfo) {
+		return null;
+	}
+	if (!accountInfo.posting_json_metadata) {
+		return undefined;
+	}
+	const postingMetadata = postingMetadataFromString(accountInfo.posting_json_metadata).profile;
+	if (postingMetadata['name']) {
+		return postingMetadata['name'];
+	}
+}
+
+export function getRecipientNetworks(did: string): NetworkOptionParam[] {
+	if (did.startsWith('hive:')) {
+		return [Network.hiveMainnet, Network.magi];
+	}
+	if (did.startsWith('did:pkh:eip155:1:')) {
+		return [
+			Network.magi,
+			{
+				...Network.hiveMainnet,
+				disabled: true,
+				disabledMemo: `Not available for EVM accounts`
+			}
+		];
+	}
+	if (did.startsWith('did:pkh:bip122:')) {
+		return [
+			Network.magi,
+			Network.btcMainnet,
+			{
+				...Network.hiveMainnet,
+				disabled: true,
+				disabledMemo: `Not available for BTC accounts`
+			}
+		];
+	}
+	if (did.startsWith('btc:')) {
+		return [Network.btcMainnet];
+	}
+	return [];
+}
+
+function getMethodNetworks(method: TransferMethod) {
+	if (method.value === TransferMethod.magiTransfer.value) {
+		return [Network.magi, Network.hiveMainnet];
+	} else if (method.value === TransferMethod.lightningTransfer.value) {
+		return [Network.lightning];
+	}
+	return [];
+}
+
+function getDidNetworks(did: string) {
+	let result = [Network.magi, Network.lightning];
+	if (did.startsWith('hive:')) result.push(Network.hiveMainnet);
+	return result;
+}
+
+const lastPaidCache: {
+	contacts: Map<string, string | 'Never'>;
+	networks: Map<string, string | 'Never'>;
+	lastLength: number;
+} = {
+	contacts: new Map(),
+	networks: new Map(),
+	lastLength: 0
+};
+export function clearLastPaidCache() {
+	lastPaidCache.contacts.clear();
+	lastPaidCache.networks.clear();
+}
+export function momentToLastPaidString(lastPaid?: Moment | 'Never') {
+	if (!lastPaid) return 'Never';
+	return lastPaid === 'Never' ? lastPaid : `on ${lastPaid.format('MMM DD, YYYY')}`;
+}
+// increment through store, keep fetching more to find last paid
+export async function getLastPaidContact(toDid: string): Promise<moment.Moment | 'Never'> {
+	const auth = get(authStore);
+	if (!auth.value?.did) return 'Never';
+	const cached = lastPaidCache.contacts.get(toDid);
+	if (cached) {
+		if (cached === 'Never') return 'Never';
+		return moment(cached);
+	}
+	let lastChecked = 0;
+	let lastLength = 0;
+	let store = get(magiTxsStore);
+	let retries = 0;
+	do {
+		if (store.length <= lastLength) {
+			retries++;
+		} else {
+			retries = 0;
+		}
+		lastLength = store.length;
+		for (const tx of store.slice(lastChecked)) {
+			if (!tx.ops) continue;
+			for (const op of tx.ops) {
+				if (op?.data.to === toDid) {
+					const date = getTimestamp(tx);
+					const valid = isValidIsoDate(date);
+					lastPaidCache.contacts.set(toDid, valid ? date : 'Never');
+					return valid ? moment(date) : 'Never';
+				}
+			}
+		}
+		lastChecked = Math.max(store.length - 1, 0);
+		await fetchTxs(auth.value.did, 'extend', undefined, 12);
+		store = get(magiTxsStore);
+	} while (store.length > lastLength && retries < 3);
+	return 'Never';
+}
+
+export function isValidIsoDate(dateString: string): boolean {
+	const date = new Date(dateString);
+	const splitChars: RegExp = /[.Z]/;
+	return !isNaN(date.getTime()) && date.toISOString().startsWith(dateString.split(splitChars)[0]);
+}
+
+// TODO: probably use a record instead, to filter by name but keep other data
+export type RecipientData = {
+	name?: string;
+	did: string;
+	date: string;
+};
+export async function getRecentContacts(auth: Auth): Promise<RecipientData[]> {
+	if (!auth.value) return [];
+	let result = new Map<string, RecipientData>();
+	let leaveOut = ['v4vapp'];
+	let lastChecked = 0;
+	let lastLength = 0;
+	let store: TransactionInter[] = get(magiTxsStore);
+	do {
+		lastLength = store.length;
+		for (const tx of store.slice(lastChecked)) {
+			if (!tx.ops) continue;
+			for (const op of tx.ops) {
+				if (!op || op.data.from !== auth.value.did) continue;
+				const username = getUsernameFromDid(op.data.to);
+				if (!leaveOut.includes(username) && !result.has(username)) {
+					result.set(username, {
+						name: (await getDisplayName(op.data.to)) ?? undefined,
+						did: op.data.to,
+						date: getTimestamp(tx)
+					});
+				}
+				if (result.size >= 3) {
+					for (const data of result.values()) {
+						lastPaidCache.contacts.set(data.did, isValidIsoDate(data.date) ? data.date : 'Never');
+					}
+					return [...result.values()];
+				}
+			}
+		}
+		lastChecked = Math.max(store.length - 1, 0);
+		const success = await waitForExtend(auth.value.did, 30);
+		if (!success) {
+			break;
+		}
+		store = get(magiTxsStore);
+	} while (store.length > lastLength);
+
+	for (const tx of store) {
+		if (!tx.ops) continue;
+		for (const op of tx.ops) {
+			if (!op || !op.data.from) continue;
+			const username = getUsernameFromDid(op.data.from);
+			if (!leaveOut.includes(username) && !result.has(username)) {
+				result.set(username, {
+					name: (await getDisplayName(op.data.from)) ?? undefined,
+					did: op.data.from,
+					date: getTimestamp(tx)
+				});
+			}
+			if (result.size >= 3) {
+				for (const data of result.values()) {
+					lastPaidCache.contacts.set(data.did, data.date);
+				}
+				return [...result.values()];
+			}
+		}
+	}
+	for (const data of result.values()) {
+		const lastPaidMoment = moment(data.date);
+		lastPaidCache.contacts.set(data.did, lastPaidMoment.toISOString());
+	}
+	return [...result.values()];
+}
+
+export async function getLastPaidNetwork(netVal?: string): Promise<moment.Moment | 'Never'> {
+	const auth = get(authStore);
+	if (!auth.value?.did || !netVal) return 'Never';
+	const cached = lastPaidCache.networks.get(netVal);
+	if (cached) {
+		if (cached === 'Never') return 'Never';
+		return moment(cached);
+	}
+	let lastChecked = 0;
+	let store: TransactionInter[] = get(magiTxsStore);
+	let lastLength = 0;
+
+	do {
+		lastLength = store.length;
+		for (const tx of store.slice(lastChecked)) {
+			if (!tx.ops) continue;
+			if (netVal.startsWith(tx.type)) {
+				const lastPaidMoment = moment(getTimestamp(tx));
+				lastPaidCache.networks.set(netVal, lastPaidMoment.toISOString());
+				return lastPaidMoment;
+			}
+		}
+		lastChecked = Math.max(store.length - 1, 0);
+		const success = await waitForExtend(auth.value.did);
+		if (!success) {
+			break;
+		}
+		store = get(magiTxsStore);
+	} while (store.length > lastLength);
+	lastPaidCache.networks.set(netVal, 'Never');
+	return 'Never';
+}
+
+export async function getFee(toAmount: string) {
+	const store = get(SendTxDetails);
+
+	if (
+		store.fromCoin &&
+		store.fromNetwork &&
+		store.toCoin &&
+		store.toCoin.coin.value !== coins.usd.value &&
+		store.toNetwork
+	) {
+		const fee = await getIntermediaryNetwork(
+			{ coin: store.fromCoin.coin, network: store.fromNetwork },
+			{ coin: store.toCoin.coin, network: store.toNetwork }
+		).feeCalculation(new CoinAmount(Number(toAmount), store.toCoin.coin), store.fromCoin.coin);
+		return fee;
+	}
+}
+
+type AccsNetsPair =
+	| {
+			accounts: SendAccount[];
+			networks?: Network[];
+	  }
+	| undefined;
+
+export function getFromOptions(
+	method: TransferMethod | undefined,
+	did: string | undefined
+): AccsNetsPair {
+	if (!method || !did) {
+		return;
+	}
+	if (method.value === TransferMethod.magiTransfer.value) {
+		let result: AccsNetsPair = { accounts: [SendAccount.magiAccount] };
+		if (did.startsWith('hive:')) {
+			result.accounts.push(SendAccount.deposit);
+			result.networks = [Network.hiveMainnet];
+		}
+		return result;
+	} else if (method.value === TransferMethod.lightningTransfer.value) {
+		return {
+			accounts: [SendAccount.swap],
+			networks: [Network.lightning]
+		};
+	}
+	return;
+}
+
+type CoinOptList = CoinOptions['coins'][number];
+export interface CoinOptionParam extends CoinOptList {
+	disabled?: boolean;
+	disabledMemo?: string;
+}
+export interface NetworkOptionParam extends Network {
+	disabled?: boolean;
+	disabledMemo?: string;
+}
+export interface AccountOptionParam extends SendAccount {
+	disabled?: boolean;
+	disabledMemo?: string;
+}
+
+type Constraints = {
+	assetOptions: CoinOptionParam[];
+	networkOptions: NetworkOptionParam[];
+};
+
+export function optionsEqual<T>(
+	a: (CoinOptionParam | AccountOptionParam | NetworkOptionParam)[],
+	b: (CoinOptionParam | AccountOptionParam | NetworkOptionParam)[]
+): boolean {
+	if (a.length !== b.length) return false;
+
+	const getValue = (item: CoinOptionParam | AccountOptionParam | NetworkOptionParam) =>
+		'coin' in item ? item.coin.value : item.value;
+
+	return a.every(
+		(val, i) =>
+			getValue(val) === getValue(b[i]) &&
+			val.disabled === b[i].disabled &&
+			val.disabledMemo === b[i].disabledMemo
+	);
+}
+
+function createSet(arr: { value: string; [key: string]: any }[] | undefined) {
+	if (!arr) {
+		return new Set<string>();
+	}
+	return new Set(arr.map((item) => item.value));
+}
+
+function toNetworkArr(set: Set<string>) {
+	return Object.values(Network).filter((net) => set.has(net.value));
+}
+
+function combineAssetOptions(
+	all: Set<string>,
+	from: Set<string>,
+	to?: Set<string>,
+	toNetwork?: Network,
+	fromNetwork?: Network
+): CoinOptionParam[] {
+	const allObjs = Object.values(swapOptions.from.coins);
+	const available = to ? from.intersection(to) : from;
+	const notInFrom = all.difference(from);
+	const notInTo = to ? all.difference(to).difference(notInFrom) : new Set<string>();
+	let result: CoinOptionParam[] = Array.from(available)
+		.map((val) => allObjs.find((coinOpt) => coinOpt.coin.value === val))
+		.filter((item): item is CoinOptionParam => item !== undefined);
+	for (const val of notInFrom) {
+		const netObj = allObjs.find((coinOpt) => coinOpt.coin.value === val);
+		if (netObj) {
+			result.push({
+				...netObj,
+				disabled: true,
+				disabledMemo: `Not available on ${fromNetwork ? 'network: ' + fromNetwork.label : 'potential source networks'}`
+			});
+		}
+	}
+	for (const val of notInTo) {
+		const netObj = allObjs.find((coinOpt) => coinOpt.coin.value === val);
+		if (netObj) {
+			result.push({
+				...netObj,
+				disabled: true,
+				disabledMemo: `Not available on recipient\'s network${toNetwork ? ': ' + toNetwork.label : ''}`
+			});
+		}
+	}
+	return result;
+}
+
+function combineNetworkOptions(
+	all: Set<string>,
+	from: Set<string>,
+	did: string
+): NetworkOptionParam[] {
+	const allObjs = Object.values(Network);
+	const notInFrom = all.difference(from);
+	let result: NetworkOptionParam[] = Array.from(from)
+		.map((val) => allObjs.find((net) => net.value === val))
+		.filter((item): item is NetworkOptionParam => item !== undefined);
+	for (const val of notInFrom) {
+		const netObj = allObjs.find((net) => net.value === val);
+		if (netObj) {
+			result.push({
+				...netObj,
+				feeCalculation: undefined,
+				disabled: true,
+				disabledMemo: `Not available for ${did.startsWith('did:pkh:eip155:1:') ? 'EVM accounts' : 'your account type'}`
+			});
+		}
+	}
+
+	return result;
+}
+
+export function solveNetworkConstraints(
+	method: TransferMethod | undefined,
+	fromCoin: CoinOptions['coins'][number] | undefined,
+	toNetwork: Network | undefined,
+	did: string | undefined,
+	fromNetwork?: Network,
+	allAssets: Boolean = false
+): Constraints {
+	// console.log("parameters to solve constraints", method, fromCoin, did, account);
+	if (!did)
+		return {
+			assetOptions: [],
+			networkOptions: []
+		};
+	const inUseNetworks = [Network.magi, Network.hiveMainnet, Network.lightning];
+	const allAssetsSet = createSet(swapOptions.from['coins'].map((item) => item.coin));
+
+	const networksGivenMethod = createSet(method ? getMethodNetworks(method) : undefined);
+	const networksGivenBoth = createSet(getDidNetworks(did)).intersection(networksGivenMethod);
+	const networkOptions = combineNetworkOptions(networksGivenMethod, networksGivenMethod, did);
+
+	const assetsGivenMethod = (() => {
+		let result = new Set<string>();
+		for (const net of method ? getMethodNetworks(method) : inUseNetworks) {
+			const coins = networkMap.get(net.value);
+			if (coins) {
+				for (const coin of coins) {
+					result.add(coin.value);
+				}
+			}
+		}
+		return result;
+	})();
+	const fromNetworkOptions: Network[] = fromNetwork ? [fromNetwork] : networkOptions;
+	const assetsGivenFromNetworks = (() => {
+		let result = new Set<string>();
+		for (const net of fromNetworkOptions) {
+			const coins = networkMap.get(net.value);
+			if (coins) {
+				for (const coin of coins) {
+					result.add(coin.value);
+				}
+			}
+		}
+		return result;
+	})();
+	// keeps only coins that are also in the toNetwork
+	const assetsGivenToNetwork = (() => {
+		if (!toNetwork) return new Set<string>();
+		const coinOpts = networkMap.get(toNetwork.value);
+		if (!coinOpts) return new Set<string>();
+		return createSet(coinOpts);
+	})();
+
+	let coinNetworkOptions: Set<string> = method
+		? createSet(getMethodNetworks(method))
+		: createSet(Object.values(Network));
+	if (fromCoin) {
+		const coinNetworks = createSet(fromCoin.networks);
+		coinNetworkOptions = coinNetworkOptions.intersection(coinNetworks);
+	}
+
+	return {
+		assetOptions: combineAssetOptions(
+			allAssets ? allAssetsSet : assetsGivenMethod,
+			assetsGivenFromNetworks,
+			method?.value === TransferMethod.lightningTransfer.value ? undefined : assetsGivenToNetwork,
+			toNetwork,
+			fromNetwork
+		),
+		networkOptions: networkOptions
+	};
+}
+
+export function solveToNetworks(): Network[] {
+	const txDetails = get(SendTxDetails);
+	const recipientNetworks: Network[] | undefined = txDetails.toUsername
+		? getRecipientNetworks(getDidFromUsername(txDetails.toUsername)).filter((net) => !net.disabled)
+		: undefined;
+	const coinNetworks =
+		txDetails.fromNetwork && txDetails.fromCoin ? txDetails.fromCoin.networks : undefined;
+	const intersection =
+		recipientNetworks && coinNetworks
+			? coinNetworks.filter((net) =>
+					recipientNetworks.map((rnet) => rnet.value).includes(net.value)
+				)
+			: (recipientNetworks ?? coinNetworks ?? []);
+	if (getUsernameFromAuth(getAuth()()) === txDetails.toUsername) {
+		return intersection.filter((net) => net.value !== txDetails.fromNetwork?.value);
+	} else {
+		return intersection;
+	}
+}
+
+export async function send(
+	details: NecessarySendDetails,
+	auth: Auth,
+	intermediary: IntermediaryNetwork,
+	setStatus: (status: string, isError?: boolean) => void,
+	signal?: AbortSignal | undefined
+): Promise<Error | { id: string }> {
+	// console.log('start of send() function, details:', details);
+	const { fromCoin, fromNetwork, amount, toCoin, toNetwork, toUsername } = details;
+	if (intermediary == Network.magi) {
+		// Email-to-escrow: if recipient is an unregistered email, create escrow
+		if (toUsername.includes('@') && toUsername.includes('.')) {
+			try {
+				const resolveRes = await fetch('/api/email-index', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ action: 'resolve', email: toUsername })
+				})
+				const resolveData = await resolveRes.json()
+
+				if (resolveData.did) {
+					details.toUsername = resolveData.did.split(':').at(-1) ?? resolveData.did
+				} else {
+					let txResult: { id: string } | null = null
+					if (ESCROW_CONTRACT_ID) {
+						setStatus('Depositing to escrow contract...')
+						const { keccak_256 } = await import('@noble/hashes/sha3')
+						const emailBytes = new TextEncoder().encode(toUsername.toLowerCase())
+						const emailHash = Array.from(keccak_256(emailBytes)).map(b => b.toString(16).padStart(2, '0')).join('')
+
+						const depositPayload: CallContractTransaction = {
+							op: 'call',
+							payload: {
+								contract_id: ESCROW_CONTRACT_ID,
+								action: 'deposit',
+								payload: JSON.stringify({
+									email_hash: emailHash,
+									asset: toCoin.coin.unit.toLowerCase(),
+									amount: amount.amount
+								}),
+								rc_limit: 500,
+								intents: [],
+								caller: auth.value!.did
+							}
+						}
+
+						const client = createClient(auth.value!.did)
+						if (auth.value?.provider === 'passkey' && auth.value.passkeySession) {
+							const signer = createPasskeySigner(auth.value.passkeySession)
+							txResult = await signAndBroadcastPasskey([depositPayload], signer, client, signal)
+						} else {
+							txResult = await signAndBrodcastTransaction([depositPayload], wagmiSigner, client, signal)
+						}
+					}
+
+					setStatus('Creating escrow record...')
+					const escrowRes = await fetch('/api/escrow', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({
+							email: toUsername,
+							amount: amount.toAmountString(),
+							asset: toCoin.coin.unit.toLowerCase(),
+							senderDid: auth.value?.did
+						})
+					})
+					const escrowData = await escrowRes.json()
+					if (!escrowRes.ok) throw new Error(escrowData.error || 'Escrow record creation failed')
+
+					await fetch('/api/send-claim-email', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({
+							email: toUsername,
+							amount: amount.toAmountString(),
+							asset: toCoin.coin.unit.toLowerCase(),
+							nonce: escrowData.nonce,
+							senderDid: auth.value?.did,
+							emailHash: escrowData.emailHash
+						})
+					})
+
+					setStatus(`Claim email sent to ${toUsername}. Funds held for 30 days.`)
+					return { id: txResult?.id ?? `escrow-${escrowData.nonce}` }
+				}
+			} catch (e) {
+				setStatus(e instanceof Error ? e.message : 'Email transfer failed', true)
+				return e instanceof Error ? e : new Error('Email transfer failed')
+			}
+		}
+
+		if (auth.value?.provider == 'passkey' && auth.value.passkeySession) {
+			const client = createClient(auth.value.did);
+			const evmToDid =
+				toNetwork.value === Network.btcMainnet.value ? toUsername : getDidFromUsername(toUsername);
+			const sendOp = getEVMOpType(
+				fromNetwork,
+				toNetwork,
+				auth.value.did,
+				evmToDid,
+				new CoinAmount(amount, toCoin.coin)
+			);
+			setStatus('Preparing transaction for signing…');
+			const signer = createPasskeySigner(auth.value.passkeySession);
+			const id = await signAndBroadcastPasskey([sendOp], signer, client, signal)
+				.then((result) => {
+					setStatus('Transaction submitted successfully!');
+					return result;
+				})
+				.catch((e: Error) => {
+					setStatus(e.message, true);
+					return e;
+				});
+			return id;
+		} else if (auth.value?.provider == 'reown') {
+			const isBtcWallet = auth.value.did.startsWith('did:pkh:bip122:');
+			const client = createClient(auth.value.did);
+
+			// console.log('created reown client:', client);
+
+			const evmToDid =
+				toNetwork.value === Network.btcMainnet.value ? toUsername : getDidFromUsername(toUsername);
+			const sendOp = getEVMOpType(
+				fromNetwork,
+				toNetwork,
+				auth.value.did,
+				evmToDid,
+				new CoinAmount(amount, toCoin.coin)
+			);
+
+			setStatus(
+				isBtcWallet ? 'Waiting for Bitcoin wallet approval…' : 'Preparing transaction for signing…'
+			);
+
+			if (!isBtcWallet && !wagmiConfig) {
+				throw new Error('EVM wallet not initialised — click Connect Wallet first');
+			}
+			const id = await (
+				isBtcWallet
+					? signAndBrodcastTransaction([sendOp], btcSigner, client, signal)
+					: signAndBrodcastTransaction([sendOp], wagmiSigner, client, signal, wagmiConfig!)
+			)
+				.then((result) => {
+					setStatus(`Transaction submitted successfully!`);
+					// TODO: add back once backend fixed
+					// addLocalTransaction({
+					// 	ops: [
+					// 		{
+					// 			data: {
+					// 				...sendOp.payload,
+					// 				type: sendOp.op
+					// 			},
+					// 			type: sendOp.op,
+					// 			index: 0
+					// 		}
+					// 	],
+					// 	timestamp: new Date(),
+					// 	id: result.id,
+					// 	type: 'vsc'
+					// });
+					return { id: result.id };
+				})
+				.catch((error) => {
+					if (error instanceof Error) {
+						if (error.message.includes('wallet')) {
+							setStatus('Please connect your wallet and try again.', true);
+						} else if (error.message.includes('422')) {
+							setStatus('Transaction format error. Please check your inputs and try again.', true);
+						} else if (error.message.includes('network') || error.message.includes('Network')) {
+							setStatus('Network error. Please check your connection and try again.', true);
+						} else if (error.message.includes('not enough RCS')) {
+							setStatus('Not enough Resource Credits. Please deposit HBD and try again.', true);
+						} else {
+							setStatus(error.message, true);
+						}
+						return error;
+					}
+					setStatus('Transaction failed.', true);
+					return new Error('Transaction failed.');
+				});
+			return id;
+		}
+		if (!auth.value?.aioha) {
+			return new Error("VSC Transactions via an EVM wallet aren't supported yet.");
+		}
+		const swapCoins = [Coin.hive.value, Coin.hbd.value, Coin.btc.value];
+		const fromIsNativeHive =
+			fromCoin.coin.value === Coin.hive.value || fromCoin.coin.value === Coin.hbd.value;
+		const fromOnMagi = fromNetwork.value === Network.magi.value;
+		const fromOnHiveL1 = fromNetwork.value === Network.hiveMainnet.value;
+		const toOnMagi = toNetwork.value === Network.magi.value;
+		const toOnHiveL1 = toNetwork.value === Network.hiveMainnet.value;
+		const toOnBtcL1 = toNetwork.value === Network.btcMainnet.value;
+		const differentCoins = fromCoin.coin.value !== toCoin.coin.value;
+		const bothSwapCoins =
+			swapCoins.includes(fromCoin.coin.value) && swapCoins.includes(toCoin.coin.value);
+
+		// Pure Magi-internal swap: both sides on Magi, different coins.
+		const isInternalSwap = fromOnMagi && toOnMagi && differentCoins && bothSwapCoins;
+		// L1→Magi swap: deposit then swap, output stays in Magi.
+		const isL1ToMagiSwap =
+			fromOnHiveL1 && toOnMagi && differentCoins && fromIsNativeHive && bothSwapCoins;
+		// Swap with external settlement: output settles on mainnet
+		// (Hive L1 or BTC L1) via the router's `destination_chain`.
+		// Source can be Magi or Hive L1 — if it's Hive L1, we also
+		// need the deposit op. Coins may match when only the network
+		// differs (e.g. HBD Magi → HBD Hive L1 isn't a swap, that's a
+		// withdrawal — so exclude that case).
+		const isSwapWithExternalSettlement =
+			(toOnHiveL1 || toOnBtcL1) &&
+			bothSwapCoins &&
+			differentCoins &&
+			(fromOnMagi || (fromOnHiveL1 && fromIsNativeHive));
+		const isSwap = isInternalSwap || isL1ToMagiSwap || isSwapWithExternalSettlement;
+		const needsDeposit = isL1ToMagiSwap || (isSwapWithExternalSettlement && fromOnHiveL1);
+
+		let sendOp: Operation;
+		// Extra op prepended for the L1→Magi case (the deposit).
+		let extraOps: Operation[] = [];
+		let opType: string | undefined;
+
+		const tx = get(SendTxDetails);
+		if (isSwap) {
+			setStatus('Waiting for Hive wallet approval…');
+			// For swap, amount_in must be the from-asset amount (asset_in), e.g. 5 TBD => 5000
+			const fromAmountStr = tx.fromAmount && tx.fromAmount !== '0' ? tx.fromAmount : amount;
+			const minOut = tx.minAmountOut ? Number(tx.minAmountOut) : undefined;
+			const fromCa = new CoinAmount(fromAmountStr, fromCoin.coin);
+			if (fromCoin.coin.value === Coin.btc.value) {
+				extraOps.push(
+					getBtcApproveOp(auth.value.username!, fromCa as CoinAmount<typeof Coin.btc>)
+				);
+			} else if (needsDeposit) {
+				// Prepend the L1→Magi deposit so the router's HiveDraw
+				// has Magi-ledger funds to pull from. Deposit amount
+				// matches the swap input amount.
+				extraOps.push(
+					getHiveDepositOp(
+						auth.value.username!,
+						`hive:${auth.value.username!}`,
+						fromCa as CoinAmount<typeof Coin.hive | typeof Coin.hbd>
+					)
+				);
+			}
+			// Pick destination_chain and recipient for the router
+			// instruction. Internal swap keeps funds on Magi (no
+			// destination_chain). External settlement needs both.
+			let destinationChain: string | undefined;
+			let destinationRecipient: string | undefined;
+			if (isSwapWithExternalSettlement) {
+				destinationChain = toOnBtcL1 ? 'BTC' : 'HIVE';
+				const raw = (toUsername ?? '').trim();
+				destinationRecipient =
+					toOnHiveL1 && !raw.startsWith('hive:') ? `hive:${raw.replace(/^@/, '')}` : raw;
+				if (!destinationRecipient) {
+					throw new Error('Missing recipient address for mainnet settlement');
+				}
+			}
+			sendOp = await getHiveSwapOp(
+				auth.value.username!,
+				fromCa,
+				fromCoin.coin as typeof Coin.hive | typeof Coin.hbd | typeof Coin.btc,
+				toCoin.coin as typeof Coin.hive | typeof Coin.hbd | typeof Coin.btc,
+				minOut,
+				destinationChain,
+				destinationRecipient
+			);
+			opType = 'swap';
+		} else if (
+			toCoin.coin.value === Coin.btc.value &&
+			toNetwork.value === Network.btcMainnet.value
+		) {
+			// BTC unmap — pass deduct_fee and max_fee from store
+			opType = 'withdrawal';
+			setStatus('Waiting for Hive wallet approval…');
+			const { getBitcoinUnmapOp: getUnmapOp } =
+				await import('$lib/magiTransactions/hive/vscOperations/bitcoin');
+			sendOp = getUnmapOp(
+				auth.value.username!,
+				auth.value.did,
+				toUsername,
+				new CoinAmount(amount, toCoin.coin),
+				tx.btcDeductFee || undefined,
+				tx.btcMaxFee
+			);
+		} else {
+			const getSendOp = getSendOpGenerator(fromNetwork, toNetwork, toCoin.coin);
+			opType = getSendOpType(fromNetwork, toNetwork);
+			setStatus('Waiting for Hive wallet approval…');
+			sendOp = getSendOp(
+				auth.value.username!,
+				getDidFromUsername(toUsername),
+				new CoinAmount(amount, toCoin.coin),
+				details.memo ? new URLSearchParams({ msg: details.memo }) : undefined
+			);
+		}
+
+		const res = await executeTx(auth.value.aioha, [...extraOps, sendOp]);
+		if (res.success) {
+			setStatus('Transaction submitted. You will be notified when your transaction is finished.');
+			// For swaps, the on-screen history should show the OUTPUT asset/amount (to side),
+			// e.g. 43 TESTS instead of 43 TBD when swapping 3 TBD -> 43 TESTS.
+			const dataAsset = toCoin!.coin;
+			const dataAmountStr = amount;
+			addLocalTransaction({
+				ops: [
+					{
+						data: {
+							amount: new CoinAmount(dataAmountStr, dataAsset).toAmountString(),
+							asset: dataAsset.unit.toLowerCase(),
+							from: auth.value.did,
+							to: isSwap ? auth.value.did : getDidFromUsername(toUsername),
+							memo: (sendOp as [string, { memo?: string }])[1]?.memo ?? '',
+							type: isSwap ? 'swap' : 'transfer'
+						},
+						type: opType!,
+						index: 0
+					}
+				],
+				timestamp: new Date(),
+				id: res.result,
+				type: 'hive'
+			});
+			return { id: res.result };
+		}
+		setStatus(res.error, true);
+		return new Error(res.error);
+	}
+
+	if (intermediary == Network.hiveMainnet) {
+		if (!auth.value?.aioha)
+			return new Error("Hive Mainnet Transactions via an EVM wallet aren't supported yet.");
+		setStatus('Waiting for Hive wallet approval…');
+		const toCoinAmount = new CoinAmount(amount, toCoin!.coin);
+		const res = await executeTx(auth.value?.aioha, [
+			[
+				'transfer',
+				{
+					from: auth.value.username!,
+					to: toUsername,
+					amount: toCoinAmount.toPrettyString(),
+					memo: details.memo ?? ''
+				}
+			] satisfies TransferOperation
+		]);
+		if (res.success) {
+			setStatus('Transaction submitted. You will be notified when your transaction is finished.');
+			addLocalTransaction({
+				ops: [
+					{
+						data: {
+							amount: new CoinAmount(amount, toCoin!.coin).toAmountString(),
+							asset: toCoin!.coin.unit.toLowerCase(),
+							from: auth.value.did,
+							to: getDidFromUsername(toUsername),
+							memo: details.memo ?? '',
+							type: 'transfer'
+						},
+						type: 'transfer',
+						index: 0
+					}
+				],
+				timestamp: new Date(),
+				id: res.result,
+				type: 'hive'
+			});
+			return { id: res.result };
+		}
+		return new Error(res.error);
+	}
+	return new Error('Unexpected Error: Unsupported transaction.');
+}
